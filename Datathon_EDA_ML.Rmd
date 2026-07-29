@@ -1,0 +1,624 @@
+---
+title: "Datathon Environmental Policy Project - R Version"
+output:
+  html_notebook: default
+  html_document: default
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core packages
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(janitor)
+  library(scales)
+})
+
+# Optional/modeling packages. Install any missing packages before running those sections.
+has_randomForest <- requireNamespace("randomForest", quietly = TRUE)
+has_caret <- requireNamespace("caret", quietly = TRUE)
+has_lpSolve <- requireNamespace("lpSolve", quietly = TRUE)
+has_igraph <- requireNamespace("igraph", quietly = TRUE)
+has_ggraph <- requireNamespace("ggraph", quietly = TRUE)
+has_vip <- requireNamespace("vip", quietly = TRUE)
+
+set.seed(42)
+```
+
+```{r paths-and-load-data}
+# Change this path to the folder where your ReFED CSV files are stored.
+DATA_DIR <- "C:/Users/argen/OneDrive/Desktop/data"
+
+SUMMARY_FILE <- file.path(DATA_DIR, "ReFED_US_Food_Surplus_Summary.csv")
+DETAIL_FILE  <- file.path(DATA_DIR, "ReFED_US_Food_Surplus_Detail.csv")
+CAUSE_FILE   <- file.path(DATA_DIR, "ReFED_US_Food_Surplus_Cause_Summary.csv")
+
+OUTPUT_DIR <- "refed_outputs"
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+load_refed_csv <- function(path) {
+  # ReFED files include a first metadata line, so skip the first row.
+  read_csv(path, skip = 1, show_col_types = FALSE) %>%
+    clean_names()
+}
+
+summary <- load_refed_csv(SUMMARY_FILE)
+detail  <- load_refed_csv(DETAIL_FILE)
+cause   <- load_refed_csv(CAUSE_FILE)
+```
+
+```{r inspect-data}
+cat("Loaded datasets:\n")
+cat("  Summary:", paste(dim(summary), collapse = " x "), "\n")
+cat("  Detail :", paste(dim(detail), collapse = " x "), "\n")
+cat("  Cause  :", paste(dim(cause), collapse = " x "), "\n\n")
+
+cat("Columns:\n")
+cat("Summary:", paste(names(summary), collapse = ", "), "\n")
+cat("Detail :", paste(names(detail), collapse = ", "), "\n")
+cat("Cause  :", paste(names(cause), collapse = ", "), "\n")
+```
+
+```{r helper-functions}
+save_plot <- function(filename, width = 10, height = 6, dpi = 300) {
+  ggsave(
+    filename = file.path(OUTPUT_DIR, filename),
+    plot = last_plot(),
+    width = width,
+    height = height,
+    dpi = dpi,
+    bg = "white"
+  )
+}
+
+normalize_series <- function(x) {
+  denom <- max(x, na.rm = TRUE) - min(x, na.rm = TRUE)
+  if (is.na(denom) || denom == 0) {
+    return(rep(0, length(x)))
+  }
+  (x - min(x, na.rm = TRUE)) / denom
+}
+
+write_output_csv <- function(df, filename) {
+  write_csv(df, file.path(OUTPUT_DIR, filename))
+}
+```
+
+```{r clean-data}
+# Trim whitespace from character columns.
+summary <- summary %>% mutate(across(where(is.character), str_trim))
+detail  <- detail  %>% mutate(across(where(is.character), str_trim))
+cause   <- cause   %>% mutate(across(where(is.character), str_trim))
+
+# Keep the latest year if multiple years are present.
+if ("year" %in% names(summary)) {
+  summary <- summary %>% filter(year == max(year, na.rm = TRUE))
+}
+if ("year" %in% names(detail)) {
+  detail <- detail %>% filter(year == max(year, na.rm = TRUE))
+}
+if ("year" %in% names(cause)) {
+  cause <- cause %>% filter(year == max(year, na.rm = TRUE))
+}
+```
+
+```{r exploratory-analysis}
+# 1A. Sector waste totals
+sector_waste <- summary %>%
+  group_by(sector) %>%
+  summarise(tons_surplus = sum(tons_surplus, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(tons_surplus))
+
+cat("\nSector waste totals:\n")
+print(sector_waste)
+
+ggplot(sector_waste, aes(x = reorder(sector, -tons_surplus), y = tons_surplus)) +
+  geom_col() +
+  labs(title = "Food Surplus by Sector", x = "Sector", y = "Tons of Surplus") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_plot("01_sector_surplus_bar.png")
+
+# 1B. Economic cost by sector
+sector_value <- summary %>%
+  group_by(sector) %>%
+  summarise(us_dollars_surplus = sum(us_dollars_surplus, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(us_dollars_surplus))
+
+cat("\nSector economic loss totals:\n")
+print(sector_value)
+
+ggplot(sector_value, aes(x = reorder(sector, -us_dollars_surplus), y = us_dollars_surplus)) +
+  geom_col() +
+  labs(title = "Economic Value of Surplus by Sector", x = "Sector", y = "US Dollars") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_plot("02_sector_value_bar.png")
+
+# 1C. GHG emissions by sector
+ghg_by_sector <- summary %>%
+  group_by(sector) %>%
+  summarise(surplus_total_100_year_mtco2e_footprint = sum(surplus_total_100_year_mtco2e_footprint, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(surplus_total_100_year_mtco2e_footprint))
+
+cat("\nSector GHG totals:\n")
+print(ghg_by_sector)
+
+ggplot(ghg_by_sector, aes(x = surplus_total_100_year_mtco2e_footprint, y = reorder(sector, surplus_total_100_year_mtco2e_footprint))) +
+  geom_col() +
+  labs(title = "GHG Emissions from Food Surplus by Sector", x = "MTCO2e", y = "Sector") +
+  scale_x_continuous(labels = comma) +
+  theme_minimal()
+save_plot("03_sector_ghg_barh.png")
+
+# 1D. Waste destinations
+possible_destinations <- c(
+  "tons_landfill", "tons_composting", "tons_donations", "tons_animal_feed",
+  "tons_anaerobic_digestion", "tons_incineration", "tons_not_harvested",
+  "tons_land_application", "tons_industrial_uses", "tons_sewer", "tons_dumping"
+)
+destination_cols <- intersect(possible_destinations, names(detail))
+
+destination_totals <- detail %>%
+  summarise(across(all_of(destination_cols), ~ sum(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "destination", values_to = "tons") %>%
+  arrange(desc(tons))
+
+cat("\nWaste destination totals:\n")
+print(destination_totals)
+
+ggplot(destination_totals, aes(x = "", y = tons, fill = destination)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  labs(title = "Where Surplus Food Goes", x = NULL, y = NULL, fill = "Destination") +
+  theme_void()
+save_plot("04_waste_destinations_pie.png", width = 9, height = 9)
+
+ggplot(destination_totals, aes(x = reorder(destination, -tons), y = tons)) +
+  geom_col() +
+  labs(title = "Waste Destinations Totals", x = "Destination", y = "Tons") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_plot("05_waste_destinations_bar.png")
+
+# 1E. Top wasted food categories
+top_food_categories <- detail %>%
+  group_by(food_category) %>%
+  summarise(tons_surplus = sum(tons_surplus, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(tons_surplus)) %>%
+  slice_head(n = 10)
+
+cat("\nTop 10 wasted food categories:\n")
+print(top_food_categories)
+
+ggplot(top_food_categories, aes(x = reorder(food_category, -tons_surplus), y = tons_surplus)) +
+  geom_col() +
+  labs(title = "Top 10 Food Categories by Surplus", x = "Food Category", y = "Tons of Surplus") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+save_plot("06_top_food_categories_bar.png", width = 12)
+
+# 1F. Root causes of waste
+cause_group_col <- if ("cause_group" %in% names(cause)) "cause_group" else "cause_name"
+root_cause_totals <- cause %>%
+  group_by(.data[[cause_group_col]]) %>%
+  summarise(tons_surplus_due_to_cause = sum(tons_surplus_due_to_cause, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(tons_surplus_due_to_cause)) %>%
+  rename(cause_group = 1)
+
+cat("\nRoot cause totals:\n")
+print(root_cause_totals)
+
+ggplot(root_cause_totals, aes(x = tons_surplus_due_to_cause, y = reorder(cause_group, tons_surplus_due_to_cause))) +
+  geom_col() +
+  labs(title = "Root Causes of Food Surplus", x = "Tons of Surplus Due to Cause", y = "Cause Group") +
+  scale_x_continuous(labels = comma) +
+  theme_minimal()
+save_plot("07_root_causes_barh.png")
+
+# 1G. Bubble chart by sector
+sector_bubble <- summary %>%
+  group_by(sector) %>%
+  summarise(
+    tons_surplus = sum(tons_surplus, na.rm = TRUE),
+    us_dollars_surplus = sum(us_dollars_surplus, na.rm = TRUE),
+    surplus_total_100_year_mtco2e_footprint = sum(surplus_total_100_year_mtco2e_footprint, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(sector_bubble, aes(
+  x = tons_surplus,
+  y = surplus_total_100_year_mtco2e_footprint,
+  size = us_dollars_surplus,
+  label = sector
+)) +
+  geom_point(alpha = 0.7) +
+  geom_text(nudge_x = 0.02 * max(sector_bubble$tons_surplus, na.rm = TRUE), check_overlap = TRUE) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  scale_size_continuous(range = c(3, 18), labels = comma) +
+  labs(title = "Food Surplus Impact by Sector", x = "Tons of Surplus", y = "GHG Emissions (MTCO2e)", size = "Economic Value") +
+  theme_minimal()
+save_plot("08_sector_bubble.png")
+
+# 1H. Intensity metrics
+summary <- summary %>%
+  mutate(
+    ghg_per_ton = if_else(tons_surplus > 0, surplus_total_100_year_mtco2e_footprint / tons_surplus, NA_real_),
+    value_per_ton = if_else(tons_surplus > 0, us_dollars_surplus / tons_surplus, NA_real_),
+    water_per_ton = if_else(tons_surplus > 0, gallons_water_footprint / tons_surplus, NA_real_)
+  )
+
+intensity_by_sector <- summary %>%
+  group_by(sector) %>%
+  summarise(
+    ghg_per_ton = mean(ghg_per_ton, na.rm = TRUE),
+    value_per_ton = mean(value_per_ton, na.rm = TRUE),
+    water_per_ton = mean(water_per_ton, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ghg_per_ton))
+
+cat("\nIntensity metrics by sector:\n")
+print(intensity_by_sector)
+write_output_csv(intensity_by_sector, "intensity_by_sector.csv")
+
+# 1I. Destination shares by sector
+sector_destination <- detail %>%
+  group_by(sector) %>%
+  summarise(across(all_of(destination_cols), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+sector_destination_share <- sector_destination %>%
+  rowwise() %>%
+  mutate(total_destination_tons = sum(c_across(all_of(destination_cols)), na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(across(all_of(destination_cols), ~ if_else(total_destination_tons > 0, .x / total_destination_tons, 0))) %>%
+  select(-total_destination_tons)
+
+write_output_csv(sector_destination_share, "sector_destination_share.csv")
+
+sector_destination_share_long <- sector_destination_share %>%
+  pivot_longer(-sector, names_to = "destination", values_to = "share")
+
+ggplot(sector_destination_share_long, aes(x = sector, y = share, fill = destination)) +
+  geom_col() +
+  labs(title = "Destination Share of Surplus by Sector", x = "Sector", y = "Share of Destination Tons", fill = "Destination") +
+  scale_y_continuous(labels = percent) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "right")
+save_plot("09_sector_destination_stacked.png", width = 12, height = 7)
+
+# 1J. Cause heatmap-style table
+cause_heatmap <- cause %>%
+  group_by(sector, cause_group = .data[[cause_group_col]]) %>%
+  summarise(tons_surplus_due_to_cause = sum(tons_surplus_due_to_cause, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = cause_group, values_from = tons_surplus_due_to_cause, values_fill = 0)
+
+write_output_csv(cause_heatmap, "cause_heatmap_table.csv")
+```
+
+```{r policy-priority-score}
+policy_df <- summary %>%
+  group_by(sector) %>%
+  summarise(
+    tons_surplus = sum(tons_surplus, na.rm = TRUE),
+    us_dollars_surplus = sum(us_dollars_surplus, na.rm = TRUE),
+    surplus_total_100_year_mtco2e_footprint = sum(surplus_total_100_year_mtco2e_footprint, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+landfill_by_sector <- sector_destination %>%
+  rowwise() %>%
+  mutate(
+    destination_total = sum(c_across(all_of(destination_cols)), na.rm = TRUE),
+    landfill_share = if_else("tons_landfill" %in% destination_cols && destination_total > 0, tons_landfill / destination_total, 0)
+  ) %>%
+  ungroup() %>%
+  select(sector, landfill_share)
+
+policy_df <- policy_df %>%
+  left_join(landfill_by_sector, by = "sector") %>%
+  mutate(
+    landfill_share = replace_na(landfill_share, 0),
+    priority_score =
+      0.35 * normalize_series(tons_surplus) +
+      0.30 * normalize_series(surplus_total_100_year_mtco2e_footprint) +
+      0.20 * normalize_series(us_dollars_surplus) +
+      0.15 * normalize_series(landfill_share)
+  ) %>%
+  arrange(desc(priority_score))
+
+cat("\nPolicy priority ranking:\n")
+print(policy_df)
+write_output_csv(policy_df, "policy_priority_by_sector.csv")
+
+ggplot(policy_df, aes(x = reorder(sector, -priority_score), y = priority_score)) +
+  geom_col() +
+  labs(title = "Policy Priority Score by Sector", x = "Sector", y = "Priority Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_plot("10_policy_priority_score.png")
+```
+
+```{r scenario-analysis}
+scenario_rates <- c(0.10, 0.15, 0.20)
+
+scenario_df <- tibble(reduction_rate = scenario_rates) %>%
+  mutate(
+    avoided_tons_surplus = sum(summary$tons_surplus, na.rm = TRUE) * reduction_rate,
+    avoided_us_dollars = sum(summary$us_dollars_surplus, na.rm = TRUE) * reduction_rate,
+    avoided_mtco2e = sum(summary$surplus_total_100_year_mtco2e_footprint, na.rm = TRUE) * reduction_rate,
+    avoided_gallons_water = sum(summary$gallons_water_footprint, na.rm = TRUE) * reduction_rate,
+    avoided_meals_wasted = if ("meals_wasted" %in% names(summary)) sum(summary$meals_wasted, na.rm = TRUE) * reduction_rate else NA_real_
+  )
+
+cat("\nScenario analysis:\n")
+print(scenario_df)
+write_output_csv(scenario_df, "scenario_modeling.csv")
+
+ggplot(scenario_df, aes(x = paste0(reduction_rate * 100, "%"), y = avoided_mtco2e)) +
+  geom_col() +
+  labs(title = "Avoided Emissions Under Waste Reduction Scenarios", x = "Reduction Scenario", y = "Avoided MTCO2e") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal()
+save_plot("11_scenario_avoided_emissions.png", width = 8, height = 5)
+```
+
+```{r sector-clustering}
+cluster_cols <- c(
+  "tons_surplus",
+  "us_dollars_surplus",
+  "surplus_total_100_year_mtco2e_footprint",
+  "gallons_water_footprint"
+)
+cluster_cols <- c(cluster_cols, intersect(c("tons_landfill", "tons_donations"), names(detail)))
+cluster_cols <- intersect(cluster_cols, names(detail))
+
+cluster_features <- detail %>%
+  group_by(sector) %>%
+  summarise(across(all_of(cluster_cols), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+X_cluster <- cluster_features %>%
+  select(all_of(cluster_cols)) %>%
+  scale()
+
+n_clusters <- min(3, nrow(cluster_features))
+hc <- hclust(dist(X_cluster), method = "ward.D2")
+cluster_features <- cluster_features %>%
+  mutate(cluster = factor(cutree(hc, k = n_clusters)))
+
+cat("\nCluster assignments:\n")
+print(cluster_features)
+
+ggplot(cluster_features, aes(
+  x = tons_surplus,
+  y = surplus_total_100_year_mtco2e_footprint,
+  color = cluster,
+  label = sector
+)) +
+  geom_point(size = 4) +
+  geom_text(nudge_x = 0.02 * max(cluster_features$tons_surplus, na.rm = TRUE), check_overlap = TRUE) +
+  labs(title = "Sector Clusters by Surplus and Emissions", x = "Tons of Surplus", y = "GHG Emissions (MTCO2e)", color = "Cluster") +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal()
+```
+
+```{r random-forest-regression}
+regression_features <- intersect(
+  c("tons_surplus", "gallons_water_footprint", "tons_landfill", "tons_composting", "tons_donations", "tons_animal_feed"),
+  names(detail)
+)
+
+target_col <- "surplus_total_100_year_mtco2e_footprint"
+reg_df <- detail %>%
+  select(all_of(c(regression_features, target_col))) %>%
+  drop_na()
+
+if (!has_randomForest || !has_caret) {
+  cat("Install the 'randomForest' and 'caret' packages to run this section.\n")
+} else {
+  library(randomForest)
+  library(caret)
+
+  train_index <- createDataPartition(reg_df[[target_col]], p = 0.80, list = FALSE)
+  train_df <- reg_df[train_index, ]
+  test_df  <- reg_df[-train_index, ]
+
+  rf_formula <- as.formula(paste(target_col, "~", paste(regression_features, collapse = " + ")))
+  rf_reg <- randomForest(rf_formula, data = train_df, ntree = 300, importance = TRUE)
+  y_pred <- predict(rf_reg, newdata = test_df)
+  y_test <- test_df[[target_col]]
+
+  regression_metrics <- tibble(
+    rmse = sqrt(mean((y_test - y_pred)^2, na.rm = TRUE)),
+    r2 = cor(y_test, y_pred, use = "complete.obs")^2
+  )
+
+  cat("\nRandom forest regression metrics:\n")
+  print(regression_metrics)
+
+  feature_importance <- importance(rf_reg) %>%
+    as.data.frame() %>%
+    rownames_to_column("feature") %>%
+    arrange(desc(IncNodePurity))
+
+  cat("\nRegression feature importances:\n")
+  print(feature_importance)
+  write_output_csv(feature_importance, "regression_feature_importance.csv")
+
+  ggplot(feature_importance, aes(x = IncNodePurity, y = reorder(feature, IncNodePurity))) +
+    geom_col() +
+    labs(title = "Feature Importance for Predicting GHG Emissions", x = "Importance", y = NULL) +
+    theme_minimal()
+  save_plot("13_regression_feature_importance.png", width = 8, height = 5)
+
+  actual_predicted <- tibble(actual = y_test, predicted = as.numeric(y_pred))
+  ggplot(actual_predicted, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.5) +
+    geom_abline(slope = 1, intercept = 0) +
+    labs(title = "Actual vs Predicted GHG Emissions", x = "Actual MTCO2e", y = "Predicted MTCO2e") +
+    theme_minimal()
+  save_plot("14_actual_vs_predicted_ghg.png", width = 7, height = 7)
+}
+```
+
+```{r random-forest-classification}
+clf_features <- intersect(c("tons_landfill", "tons_donations", "gallons_water_footprint", "tons_animal_feed", "tons_composting"), names(detail))
+clf_df <- detail %>%
+  select(all_of(c(clf_features, "tons_surplus"))) %>%
+  drop_na() %>%
+  mutate(high_waste = factor(if_else(tons_surplus > median(tons_surplus, na.rm = TRUE), "high", "low")))
+
+if (!has_randomForest || !has_caret) {
+  cat("Install the 'randomForest' and 'caret' packages to run this section.\n")
+} else {
+  library(randomForest)
+  library(caret)
+
+  clf_index <- createDataPartition(clf_df$high_waste, p = 0.80, list = FALSE)
+  clf_train <- clf_df[clf_index, ]
+  clf_test  <- clf_df[-clf_index, ]
+
+  clf_formula <- as.formula(paste("high_waste ~", paste(clf_features, collapse = " + ")))
+  rf_clf <- randomForest(clf_formula, data = clf_train, ntree = 300, importance = TRUE)
+  yc_pred <- predict(rf_clf, newdata = clf_test)
+
+  classification_metrics <- tibble(accuracy = mean(yc_pred == clf_test$high_waste))
+  cat("\nRandom forest classification metrics:\n")
+  print(classification_metrics)
+  print(confusionMatrix(yc_pred, clf_test$high_waste))
+
+  clf_importance <- importance(rf_clf) %>%
+    as.data.frame() %>%
+    rownames_to_column("feature") %>%
+    arrange(desc(MeanDecreaseGini))
+
+  write_output_csv(clf_importance, "classification_feature_importance.csv")
+
+  ggplot(clf_importance, aes(x = MeanDecreaseGini, y = reorder(feature, MeanDecreaseGini))) +
+    geom_col() +
+    labs(title = "Feature Importance for High-Waste Classification", x = "Importance", y = NULL) +
+    theme_minimal()
+  save_plot("15_classification_feature_importance.png", width = 8, height = 5)
+}
+```
+
+```{r shap-or-feature-explanation}
+# The original Python notebook used SHAP as an optional section.
+# In R, exact SHAP-style explanations depend on the model object and available packages.
+# This notebook keeps the section optional and uses vip when available.
+if (has_vip && exists("rf_reg")) {
+  library(vip)
+  vip(rf_reg, num_features = length(regression_features)) +
+    ggtitle("Variable Importance for GHG Regression Model")
+  save_plot("16_variable_importance_vip.png")
+} else {
+  cat("\nPackage 'vip' is not installed or the regression model was not created. Skipping optional model explanation section.\n")
+}
+```
+
+```{r network-analysis}
+network_df <- detail %>%
+  select(sector, food_category, tons_surplus) %>%
+  drop_na() %>%
+  group_by(sector, food_category) %>%
+  summarise(tons_surplus = sum(tons_surplus, na.rm = TRUE), .groups = "drop")
+
+if (!has_igraph) {
+  cat("Install the 'igraph' package to run network centrality and plotting.\n")
+} else {
+  library(igraph)
+
+  G <- graph_from_data_frame(network_df, directed = TRUE)
+  centrality <- tibble(
+    node = names(degree(G, mode = "all", normalized = TRUE)),
+    degree_centrality = as.numeric(degree(G, mode = "all", normalized = TRUE))
+  ) %>%
+    arrange(desc(degree_centrality))
+
+  cat("\nTop network nodes by degree centrality:\n")
+  print(head(centrality, 15))
+  write_output_csv(centrality, "network_degree_centrality.csv")
+
+  top_edges <- network_df %>% arrange(desc(tons_surplus)) %>% slice_head(n = 100)
+  write_output_csv(top_edges, "top_sector_food_edges.csv")
+
+  plot_edges <- network_df %>% arrange(desc(tons_surplus)) %>% slice_head(n = 25)
+  G_plot <- graph_from_data_frame(plot_edges, directed = TRUE)
+
+  if (has_ggraph) {
+    library(ggraph)
+    ggraph(G_plot, layout = "fr") +
+      geom_edge_link(aes(width = tons_surplus), alpha = 0.6, arrow = arrow(length = unit(3, "mm")), end_cap = circle(3, "mm")) +
+      geom_node_point(size = 5, alpha = 0.9) +
+      geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+      scale_edge_width(range = c(0.5, 4)) +
+      labs(title = "Top Sector → Food Category Surplus Pathways") +
+      theme_void()
+    save_plot("17_network_top_pathways.png", width = 14, height = 10)
+  } else {
+    plot(G_plot, vertex.size = 8, vertex.label.cex = 0.7, edge.width = scales::rescale(E(G_plot)$tons_surplus, to = c(1, 8)), main = "Top Sector → Food Category Surplus Pathways")
+  }
+}
+```
+
+```{r optimization}
+# Hypothetical intervention cost units by sector. Replace with real policy cost estimates if available.
+optimization_df <- policy_df %>%
+  mutate(
+    intervention_cost = rep(c(3, 4, 2, 5, 3, 4, 2, 3, 4, 2), length.out = n()),
+    emissions_benefit = surplus_total_100_year_mtco2e_footprint
+  )
+
+costs <- optimization_df$intervention_cost
+benefits <- optimization_df$emissions_benefit
+budget <- min(10, sum(costs, na.rm = TRUE))
+
+if (has_lpSolve) {
+  library(lpSolve)
+  result <- lp(
+    direction = "max",
+    objective.in = benefits,
+    const.mat = matrix(costs, nrow = 1),
+    const.dir = "<=",
+    const.rhs = budget,
+    all.bin = TRUE
+  )
+  optimization_df <- optimization_df %>%
+    mutate(optimal_allocation = if (result$status == 0) result$solution else 0)
+} else {
+  cat("Package 'lpSolve' is not installed. Using a greedy benefit-per-cost fallback.\n")
+  optimization_df <- optimization_df %>%
+    mutate(benefit_per_cost = emissions_benefit / intervention_cost) %>%
+    arrange(desc(benefit_per_cost))
+
+  remaining_budget <- budget
+  allocation <- numeric(nrow(optimization_df))
+  for (i in seq_len(nrow(optimization_df))) {
+    if (remaining_budget <= 0) break
+    allocation[i] <- min(1, remaining_budget / optimization_df$intervention_cost[i])
+    remaining_budget <- remaining_budget - allocation[i] * optimization_df$intervention_cost[i]
+  }
+
+  optimization_df <- optimization_df %>%
+    mutate(optimal_allocation = allocation) %>%
+    select(-benefit_per_cost)
+}
+
+optimization_df <- optimization_df %>% arrange(desc(optimal_allocation))
+
+cat("\nOptimization results:\n")
+print(optimization_df %>% select(sector, intervention_cost, emissions_benefit, optimal_allocation))
+write_output_csv(optimization_df, "optimization_results.csv")
+
+ggplot(optimization_df, aes(x = reorder(sector, -optimal_allocation), y = optimal_allocation)) +
+  geom_col() +
+  labs(title = "Optimal Intervention Allocation by Sector", x = "Sector", y = "Allocation Share") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_plot("18_optimization_allocation.png")
+```
